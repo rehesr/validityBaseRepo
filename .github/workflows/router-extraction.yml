@@ -1,0 +1,36 @@
+name: Router Extraction
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_config:
+        description: "Path to run config"
+        required: true
+        default: "config/runs/sample.yaml"
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run extraction
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python src/run_extraction.py --run-config "${{ github.event.inputs.run_config }}"
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: extraction-outputs
+          path: outputs/
