@@ -1,5 +1,5 @@
 name: flagship
-prompt: prompts/tickerize_v1.txt
+prompt: prompts/tickerize_v2.txt
 model_group: flagship
 input_dir: ~/data/tickerization/inputs/articles
 reference: ~/data/tickerization/inputs/reference.json

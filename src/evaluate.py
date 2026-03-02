@@ -29,11 +29,26 @@ def parse_model_tickers(result_path: str | Path, threshold: float = 0.5) -> tupl
         content = content.split("\n", 1)[1].rsplit("```", 1)[0]
     try:
         labels = json.loads(content)
-        return {
-            label["ticker"]
-            for label in labels
-            if label.get("confidence", 1.0) >= threshold
-        }, False
+        if isinstance(labels, dict):
+            labels = labels.get("tickers")
+        if not isinstance(labels, list):
+            return set(), True
+
+        tickers: set[str] = set()
+        for label in labels:
+            if not isinstance(label, dict):
+                return set(), True
+
+            ticker = label.get("ticker")
+            confidence = label.get("confidence", 1.0)
+            if not isinstance(ticker, str):
+                return set(), True
+            if not isinstance(confidence, (int, float)):
+                return set(), True
+            if confidence >= threshold:
+                tickers.add(ticker)
+
+        return tickers, False
     except (json.JSONDecodeError, KeyError, TypeError):
         return set(), True
 
