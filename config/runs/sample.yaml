@@ -1,6 +1,6 @@
 run_name: holdings_extract_sample
 model_alias: fast
-prompt_file: prompts/holdings_extractor.txt
+prompt_file: prompts/letters_prompt.txt
 dataset_glob: datasets/sample/*.pdf
 temperature: 0.0
 max_tokens: 1800
