@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Dict, List
 
 
-def build_json_only_messages(text: str, file_name: str, prompt_path: str = "prompts/holdings_extractor.txt") -> List[Dict[str, str]]:
+def build_json_only_messages(text: str, file_name: str, prompt_path: str = "prompts/letters_prompt.txt") -> List[Dict[str, str]]:
     template = Path(prompt_path).read_text(encoding="utf-8")
     rendered_prompt = template.replace("{{PDF_NAME}}", file_name).replace("{{PDF_TEXT}}", text)
     system_prompt = (

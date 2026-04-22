@@ -20,7 +20,7 @@ def _extract_content(response_json: Dict[str, Any]) -> str:
 def run_one(
     file_path: str,
     model: str = "openai/gpt-4o-mini",
-    prompt_path: str = "prompts/holdings_extractor.txt",
+    prompt_path: str = "prompts/letters_prompt.txt",
 ) -> HoldingsExtraction:
     load_dotenv()
     input_path = Path(file_path)
@@ -49,7 +49,7 @@ def run_one(
 def run_from_folder(
     folder_path: str,
     model: str = "openai/gpt-4o-mini",
-    prompt_path: str = "prompts/holdings_extractor.txt",
+    prompt_path: str = "prompts/letters_prompt.txt",
 ) -> List[Dict[str, Any]]:
     folder = Path(folder_path)
     results: List[Dict[str, Any]] = []
