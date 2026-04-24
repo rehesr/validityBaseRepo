@@ -1,3 +1,7 @@
+openai
+pyyaml
+pandas
+matplotlib
 requests
 python-dotenv
 pydantic
