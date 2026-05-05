@@ -1,7 +1,7 @@
 name: light
-prompt: prompts/tickerize_v1.txt
+prompt: prompts/tickerize_v2.txt
 model_group: light
-input_dir: ~/data/tickerization/inputs/articles
+input_dir: ~/data/tickerization/inputs/ticker_articles
 reference: ~/data/tickerization/inputs/reference.json
 output_base: ~/data/tickerization/experiments
 temperature: 0

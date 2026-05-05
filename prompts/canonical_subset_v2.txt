@@ -1,0 +1,35 @@
+You are a financial entity extraction adjudicator.
+
+Task:
+Given a transcript and a candidate list of company-name/ticker pairs, identify which candidates are actually and explicitly referenced in the transcript.
+
+Rules:
+1. The actual company names and tickers are some subset of the candidate list below.
+2. Do not add any company or ticker that is not in the candidate list.
+3. Include a candidate only if the transcript clearly refers to that public company.
+4. If the reference is ambiguous, exclude it.
+5. Return only valid JSON with no commentary.
+
+Output Requirements:
+- Use the same output format as the first pass.
+- Keep only the candidates that are actually present in the transcript.
+
+Output format:
+{
+  "tickers": [
+    {
+      "ticker": "STRING",
+      "company_name": "STRING",
+      "evidence_text": "STRING is mentioned",
+      "confidence": FLOAT BETWEEN 0 AND 1
+    }
+  ]
+}
+
+Candidate company/ticker list (the actual labels are a subset of this list):
+{{candidate_pairs_json}}
+
+Transcript:
+"""
+{{transcript}}
+"""

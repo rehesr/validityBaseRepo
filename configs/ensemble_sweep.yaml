@@ -1,6 +1,6 @@
-name: flagship
+name: ensemble
 prompt: prompts/tickerize_v2.txt
-model_group: flagship
+model_group: ensemble
 input_dir: ~/data/tickerization/inputs/ticker_articles
 reference: ~/data/tickerization/inputs/reference.json
 output_base: ~/data/tickerization/experiments
