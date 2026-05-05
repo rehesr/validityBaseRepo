@@ -17,6 +17,7 @@ Rules:
    to public companies in the transcript.
 9. Return an empty result only if the transcript truly contains no explicit public-company
    references at all.
+10. Use US tickers only; if no US ticker is available, drop the company.
 
 Output Requirements:
 - Return only valid JSON.
