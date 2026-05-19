@@ -6,12 +6,6 @@ from typing import Any
 
 from openai import OpenAI
 
-_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ.get("OPENROUTER_API_KEY"),
-)
-
-
 def call_model(
     model_id: str,
     prompt: str,
@@ -19,9 +13,13 @@ def call_model(
     max_tokens: int = 4096,
 ) -> dict[str, Any]:
     """Call a model via OpenRouter and return a full log-friendly record."""
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ.get("OPENROUTER_API_KEY"),
+    )
     t0 = time.time()
     try:
-        response = _client.chat.completions.create(
+        response = client.chat.completions.create(
             model=model_id,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
