@@ -15,7 +15,7 @@ def call_model(
     """Call a model via OpenRouter and return a full log-friendly record."""
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ.get("OPENROUTER_API_KEY"),
+        api_key=os.environ.get("OPENROUTER_API_KEY") or "not-set",
     )
     t0 = time.time()
     try:
