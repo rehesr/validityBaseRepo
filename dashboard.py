@@ -1,10 +1,12 @@
 """Streamlit dashboard for the tickerization benchmark."""
 
 import ast
+import io
 import json
 import os
 import tempfile
 import time
+import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -439,19 +441,56 @@ with tab_extract:
                     value=_ex["model_group"],
                     key="ex_save_name",
                 )
-                st.caption(f"Will save as **{_ex['doc_id']}** inside `{exp_base / (_save_name + '_<timestamp>')}`")
-                if st.button("Save", type="primary", key="ex_save_btn"):
-                    try:
-                        _ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                        _new_exp = exp_base / f"{_save_name}_{_ts}"
-                        _res_dir = _new_exp / "results"
-                        _res_dir.mkdir(parents=True, exist_ok=True)
+                _ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                _exp_folder_name = f"{_save_name}_{_ts}"
+
+                _scol1, _scol2 = st.columns(2)
+
+                # ── Save to disk ──────────────────────────────────────────────
+                with _scol1:
+                    st.caption("**Save locally**")
+                    if not exp_base_str.strip():
+                        st.warning("Set an experiments directory in the sidebar first.")
+                    else:
+                        st.caption(f"→ `{exp_base / _exp_folder_name}`")
+                        if st.button("Save to disk", type="primary", key="ex_save_btn"):
+                            try:
+                                _new_exp = exp_base / _exp_folder_name
+                                _res_dir = _new_exp / "results"
+                                _res_dir.mkdir(parents=True, exist_ok=True)
+                                for _m in _ex["model_options"]:
+                                    _r = _ex["results"].get(_m["name"], {})
+                                    _slug = _m["id"].replace("/", "_")
+                                    _out = _res_dir / f"{_slug}__{_ex['doc_id']}.json"
+                                    with _out.open("w", encoding="utf-8") as _f:
+                                        json.dump(_r, _f, indent=2, ensure_ascii=False)
+                                _cfg = {
+                                    "name": _save_name,
+                                    "model_group": _ex["model_group"],
+                                    "input_dir": "",
+                                    "temperature": _ex["temperature"],
+                                    "max_tokens": _ex["max_tokens"],
+                                    "models": _ex["model_options"],
+                                }
+                                with (_new_exp / "config.yaml").open("w", encoding="utf-8") as _f:
+                                    yaml.safe_dump(_cfg, _f, sort_keys=False)
+                                st.success(f"Saved to `{_new_exp}`")
+                            except Exception as _exc:
+                                st.error(f"Save failed: {_exc}")
+
+                # ── Download as zip ───────────────────────────────────────────
+                with _scol2:
+                    st.caption("**Download as zip**")
+                    st.caption("Unzip locally and load via Sweep Results.")
+                    _zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
                         for _m in _ex["model_options"]:
                             _r = _ex["results"].get(_m["name"], {})
                             _slug = _m["id"].replace("/", "_")
-                            _out = _res_dir / f"{_slug}__{_ex['doc_id']}.json"
-                            with _out.open("w", encoding="utf-8") as _f:
-                                json.dump(_r, _f, indent=2, ensure_ascii=False)
+                            _zf.writestr(
+                                f"{_exp_folder_name}/results/{_slug}__{_ex['doc_id']}.json",
+                                json.dumps(_r, indent=2, ensure_ascii=False),
+                            )
                         _cfg = {
                             "name": _save_name,
                             "model_group": _ex["model_group"],
@@ -460,11 +499,17 @@ with tab_extract:
                             "max_tokens": _ex["max_tokens"],
                             "models": _ex["model_options"],
                         }
-                        with (_new_exp / "config.yaml").open("w", encoding="utf-8") as _f:
-                            yaml.safe_dump(_cfg, _f, sort_keys=False)
-                        st.success(f"Saved to `{_new_exp}`")
-                    except Exception as _exc:
-                        st.error(f"Save failed: {_exc}")
+                        _zf.writestr(
+                            f"{_exp_folder_name}/config.yaml",
+                            yaml.safe_dump(_cfg, sort_keys=False),
+                        )
+                    st.download_button(
+                        "Download zip",
+                        data=_zip_buf.getvalue(),
+                        file_name=f"{_exp_folder_name}.zip",
+                        mime="application/zip",
+                        key="ex_download_btn",
+                    )
 
     # ── Full sweep (batch) ────────────────────────────────────────────────────
     else:
