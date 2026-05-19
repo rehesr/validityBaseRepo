@@ -733,7 +733,7 @@ with tab_results:
     else:
         exp_names = [p.name for p in experiments]
         selected_exp_name = st.selectbox("Experiment", exp_names, key="results_exp_select")
-        selected_exp = exp_base / selected_exp_name
+        selected_exp = next(p for p in experiments if p.name == selected_exp_name)
 
         # ── Evaluate ──────────────────────────────────────────────────────────
         has_results = load_scores_csv(selected_exp) is not None
