@@ -475,8 +475,17 @@ with tab_extract:
                                 with (_new_exp / "config.yaml").open("w", encoding="utf-8") as _f:
                                     yaml.safe_dump(_cfg, _f, sort_keys=False)
                                 st.success(f"Saved to `{_new_exp}`")
+                            except PermissionError:
+                                st.warning(
+                                    "Could not write to that path — this usually means the app "
+                                    "is running on a remote server where your local filesystem "
+                                    "isn't accessible. Use **Download as zip** on the right instead."
+                                )
                             except Exception as _exc:
-                                st.error(f"Save failed: {_exc}")
+                                st.warning(
+                                    f"Save failed: {_exc}  \n"
+                                    "Try **Download as zip** on the right as an alternative."
+                                )
 
                 # ── Download as zip ───────────────────────────────────────────
                 with _scol2:
@@ -518,13 +527,18 @@ with tab_extract:
             sw_input_dir = st.text_input(
                 "Input directory (articles)",
                 value="",
-                help="Directory containing .txt article files.",
+                help="Local directory containing .txt article files.",
+            )
+            sw_zip_upload = st.file_uploader(
+                "Or upload a zip of .txt articles",
+                type=["zip"],
+                help="Zip file containing .txt files (any folder depth).",
             )
         with sw_col2:
             sw_output_base = st.text_input(
                 "Output directory",
                 value=str(exp_base),
-                help="Base directory to save experiment results.",
+                help="Leave blank to download results as a zip instead.",
             )
         sw_exp_name = st.text_input(
             "Experiment name",
@@ -533,96 +547,154 @@ with tab_extract:
             help="Prefix for the experiment folder (a timestamp is appended automatically).",
         )
 
-        sw_input_path = Path(os.path.expanduser(sw_input_dir))
-        sw_articles = sorted(sw_input_path.glob("*.txt")) if sw_input_path.exists() else []
+        # Resolve article list: directory → zip upload → nothing
+        sw_input_path = Path(os.path.expanduser(sw_input_dir)) if sw_input_dir.strip() else None
+        if sw_input_path and sw_input_path.exists():
+            sw_articles: list[tuple[str, str]] = [
+                (p.stem, p.read_text(encoding="utf-8"))
+                for p in sorted(sw_input_path.glob("*.txt"))
+            ]
+            if not sw_articles:
+                st.warning(
+                    f"No .txt files found in `{sw_input_path}`. "
+                    "Check the path or upload a zip of your articles above."
+                )
+        elif sw_input_path and not sw_input_path.exists():
+            st.warning(
+                f"Directory `{sw_input_path}` not found — it may be a local path not accessible "
+                "from this server. Upload a zip of your articles above instead."
+            )
+            if sw_zip_upload:
+                sw_articles = []
+                with zipfile.ZipFile(io.BytesIO(sw_zip_upload.read())) as zf:
+                    for name in sorted(zf.namelist()):
+                        if name.endswith(".txt") and not Path(name).name.startswith("."):
+                            sw_articles.append((Path(name).stem, zf.read(name).decode("utf-8")))
+            else:
+                sw_articles = []
+        elif sw_zip_upload:
+            sw_articles = []
+            with zipfile.ZipFile(io.BytesIO(sw_zip_upload.read())) as zf:
+                for name in sorted(zf.namelist()):
+                    if name.endswith(".txt") and not Path(name).name.startswith("."):
+                        sw_articles.append((Path(name).stem, zf.read(name).decode("utf-8")))
+        else:
+            sw_articles = []
+
         st.caption(
-            f"{len(sw_articles)} article(s) found · {len(model_options)} model(s) · "
+            f"{len(sw_articles)} article(s) · {len(model_options)} model(s) · "
             f"{len(sw_articles) * len(model_options)} total API calls"
         )
 
-        can_sweep = bool(api_key)
+        can_sweep = bool(api_key) and bool(sw_articles)
         sweep_clicked = st.button(
             "Run Sweep", disabled=not can_sweep, type="primary", key="run_sweep_btn"
         )
+        if not sw_articles and api_key:
+            st.caption("Add an input directory or upload a zip of .txt files to enable the sweep.")
 
         if sweep_clicked and can_sweep:
-            if not sw_articles:
-                st.error(f"No .txt files found in `{sw_input_path}`.")
-            else:
-                sw_output_path = Path(os.path.expanduser(sw_output_base))
-                total_calls = len(model_options) * len(sw_articles)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            sw_exp_folder = f"{sw_exp_name}_{ts}"
+            total_calls = len(model_options) * len(sw_articles)
+            os.environ["OPENROUTER_API_KEY"] = api_key
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            done = 0
+            failed = 0
 
-                ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                new_exp_dir = sw_output_path / f"{sw_exp_name}_{ts}"
-                results_dir_sw = new_exp_dir / "results"
-                results_dir_sw.mkdir(parents=True, exist_ok=True)
-                log_path = new_exp_dir / "log.jsonl"
+            sw_results_mem: list[tuple[str, str, dict]] = []
+            log_lines: list[str] = []
 
-                prompt_txt_path = str(new_exp_dir / "prompt.txt")
-                cfg_to_save = {
-                    "name": sw_exp_name,
-                    "model_group": model_group,
-                    "prompt": prompt_txt_path,
-                    "input_dir": sw_input_dir,
-                    "output_base": sw_output_base,
-                    "temperature": temperature,
-                    "max_tokens": int(max_tokens),
-                    "models": model_options,
-                }
-                with (new_exp_dir / "config.yaml").open("w", encoding="utf-8") as f:
-                    yaml.safe_dump(cfg_to_save, f, sort_keys=False)
-                with (new_exp_dir / "prompt.txt").open("w", encoding="utf-8") as f:
-                    f.write(prompt_template)
+            for model in model_options:
+                for doc_id, text in sw_articles:
+                    prompt = prompt_template.replace("{{transcript}}", text)
+                    status_text.caption(f"[{done + 1}/{total_calls}] {model['name']} × {doc_id}")
+                    result = _sweep_call_model(model["id"], prompt, temperature, int(max_tokens))
+                    model_slug = model["id"].replace("/", "_")
+                    sw_results_mem.append((model_slug, doc_id, result))
+                    log_lines.append(json.dumps({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "model": model["id"],
+                        "model_name": model["name"],
+                        "doc_id": doc_id,
+                        "latency_ms": result.get("latency_ms"),
+                        "input_tokens": result.get("input_tokens"),
+                        "output_tokens": result.get("output_tokens"),
+                        "finish_reason": result.get("finish_reason"),
+                        "error": result.get("error"),
+                    }, ensure_ascii=False))
+                    if result.get("error"):
+                        failed += 1
+                    done += 1
+                    progress_bar.progress(done / total_calls)
 
-                os.environ["OPENROUTER_API_KEY"] = api_key
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
-                done = 0
-                failed = 0
+            status_text.empty()
+            progress_bar.empty()
+            msg = f"Sweep complete — {done} calls, {failed} error(s)"
+            st.success(msg) if not failed else st.warning(msg)
 
-                for model in model_options:
-                    for art_path in sw_articles:
-                        doc_id = art_path.stem
-                        text = art_path.read_text(encoding="utf-8")
-                        prompt = prompt_template.replace("{{transcript}}", text)
+            cfg_to_save = {
+                "name": sw_exp_name,
+                "model_group": model_group,
+                "input_dir": sw_input_dir,
+                "output_base": sw_output_base,
+                "temperature": temperature,
+                "max_tokens": int(max_tokens),
+                "models": model_options,
+            }
 
-                        status_text.caption(f"[{done + 1}/{total_calls}] {model['name']} × {doc_id}")
-                        result = _sweep_call_model(
-                            model["id"], prompt, temperature, int(max_tokens)
-                        )
-
-                        result_file = results_dir_sw / f"{model['id'].replace('/', '_')}__{doc_id}.json"
+            # ── Try saving to disk ────────────────────────────────────────────
+            saved_to_disk = False
+            if sw_output_base.strip():
+                try:
+                    new_exp_dir = Path(os.path.expanduser(sw_output_base)) / sw_exp_folder
+                    results_dir_sw = new_exp_dir / "results"
+                    results_dir_sw.mkdir(parents=True, exist_ok=True)
+                    for model_slug, doc_id, result in sw_results_mem:
+                        result_file = results_dir_sw / f"{model_slug}__{doc_id}.json"
                         with result_file.open("w", encoding="utf-8") as f:
                             json.dump(result, f, indent=2, ensure_ascii=False)
                             f.write("\n")
+                    with (new_exp_dir / "config.yaml").open("w", encoding="utf-8") as f:
+                        yaml.safe_dump(cfg_to_save, f, sort_keys=False)
+                    with (new_exp_dir / "log.jsonl").open("w", encoding="utf-8") as f:
+                        f.write("\n".join(log_lines) + "\n")
+                    st.success(f"Results saved to `{new_exp_dir}`.")
+                    st.caption("Go to **Sweep Results** to run evaluation on this experiment.")
+                    saved_to_disk = True
+                except PermissionError:
+                    st.warning(
+                        "Could not write to that output path — the app is likely running on a "
+                        "remote server. Download the results as a zip below."
+                    )
+                except Exception as exc:
+                    st.warning(f"Save failed: {exc}  \nDownload the results as a zip below.")
 
-                        log_entry = {
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "model": model["id"],
-                            "model_name": model["name"],
-                            "doc_id": doc_id,
-                            "latency_ms": result.get("latency_ms"),
-                            "input_tokens": result.get("input_tokens"),
-                            "output_tokens": result.get("output_tokens"),
-                            "finish_reason": result.get("finish_reason"),
-                            "error": result.get("error"),
-                        }
-                        with log_path.open("a", encoding="utf-8") as f:
-                            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-
-                        if result.get("error"):
-                            failed += 1
-                        done += 1
-                        progress_bar.progress(done / total_calls)
-
-                status_text.empty()
-                progress_bar.empty()
-                msg = f"Sweep complete — {done} calls"
-                if failed:
-                    st.warning(f"{msg}, {failed} error(s). Results saved to `{new_exp_dir}`.")
-                else:
-                    st.success(f"{msg}, 0 errors. Results saved to `{new_exp_dir}`.")
-                st.caption("Go to **Sweep Results** to run evaluation on this experiment.")
+            # ── Download as zip (fallback) ────────────────────────────────────
+            if not saved_to_disk:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for model_slug, doc_id, result in sw_results_mem:
+                        zf.writestr(
+                            f"{sw_exp_folder}/results/{model_slug}__{doc_id}.json",
+                            json.dumps(result, indent=2, ensure_ascii=False),
+                        )
+                    zf.writestr(
+                        f"{sw_exp_folder}/config.yaml",
+                        yaml.safe_dump(cfg_to_save, sort_keys=False),
+                    )
+                    zf.writestr(
+                        f"{sw_exp_folder}/log.jsonl",
+                        "\n".join(log_lines) + "\n",
+                    )
+                st.download_button(
+                    "Download results as zip",
+                    data=zip_buf.getvalue(),
+                    file_name=f"{sw_exp_folder}.zip",
+                    mime="application/zip",
+                )
+                st.caption("Unzip locally and load the folder via Sweep Results.")
 
 # ── Tab 2: Sweep Results ──────────────────────────────────────────────────────
 
