@@ -198,7 +198,7 @@ with st.sidebar:
 
     exp_base_str = st.text_input(
         "Experiments directory",
-        value=os.path.expanduser("~/data/tickerization/experiments"),
+        value="",
         help="Base directory where sweep results are stored.",
     )
     exp_base = Path(exp_base_str).expanduser()
@@ -269,6 +269,8 @@ with tab_extract:
         elif pasted.strip():
             article_text = pasted.strip()
 
+        _doc_id = Path(uploaded.name).stem if uploaded else f"paste_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
         can_run = bool(article_text) and bool(api_key)
         btn_label = f"Sweep {len(model_options)} models" if sweep_mode else "Extract"
         run_clicked = st.button(btn_label, disabled=not can_run, type="primary")
@@ -319,6 +321,16 @@ with tab_extract:
 
                     with st.expander("Raw model response"):
                         st.code(content, language="json")
+
+                    st.session_state["_last_extract"] = {
+                        "mode": "single",
+                        "doc_id": _doc_id,
+                        "model_options": [selected_model],
+                        "results": {selected_model["name"]: result},
+                        "model_group": model_group,
+                        "temperature": temperature,
+                        "max_tokens": int(max_tokens),
+                    }
 
             else:
                 with st.spinner(f"Calling {len(model_options)} models in parallel..."):
@@ -408,13 +420,59 @@ with tab_extract:
                         st.markdown(f"**{m['name']}**")
                         st.code(r.get("content") or r.get("error") or "", language="json")
 
+                st.session_state["_last_extract"] = {
+                    "mode": "sweep",
+                    "doc_id": _doc_id,
+                    "model_options": model_options,
+                    "results": sweep_results,
+                    "model_group": model_group,
+                    "temperature": temperature,
+                    "max_tokens": int(max_tokens),
+                }
+
+        if "_last_extract" in st.session_state:
+            _ex = st.session_state["_last_extract"]
+            st.divider()
+            with st.expander("Save to experiments"):
+                _save_name = st.text_input(
+                    "Experiment name",
+                    value=_ex["model_group"],
+                    key="ex_save_name",
+                )
+                st.caption(f"Will save as **{_ex['doc_id']}** inside `{exp_base / (_save_name + '_<timestamp>')}`")
+                if st.button("Save", type="primary", key="ex_save_btn"):
+                    try:
+                        _ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                        _new_exp = exp_base / f"{_save_name}_{_ts}"
+                        _res_dir = _new_exp / "results"
+                        _res_dir.mkdir(parents=True, exist_ok=True)
+                        for _m in _ex["model_options"]:
+                            _r = _ex["results"].get(_m["name"], {})
+                            _slug = _m["id"].replace("/", "_")
+                            _out = _res_dir / f"{_slug}__{_ex['doc_id']}.json"
+                            with _out.open("w", encoding="utf-8") as _f:
+                                json.dump(_r, _f, indent=2, ensure_ascii=False)
+                        _cfg = {
+                            "name": _save_name,
+                            "model_group": _ex["model_group"],
+                            "input_dir": "",
+                            "temperature": _ex["temperature"],
+                            "max_tokens": _ex["max_tokens"],
+                            "models": _ex["model_options"],
+                        }
+                        with (_new_exp / "config.yaml").open("w", encoding="utf-8") as _f:
+                            yaml.safe_dump(_cfg, _f, sort_keys=False)
+                        st.success(f"Saved to `{_new_exp}`")
+                    except Exception as _exc:
+                        st.error(f"Save failed: {_exc}")
+
     # ── Full sweep (batch) ────────────────────────────────────────────────────
     else:
         sw_col1, sw_col2 = st.columns(2)
         with sw_col1:
             sw_input_dir = st.text_input(
                 "Input directory (articles)",
-                value=os.path.expanduser("~/data/tickerization/inputs/ticker_articles"),
+                value="",
                 help="Directory containing .txt article files.",
             )
         with sw_col2:
