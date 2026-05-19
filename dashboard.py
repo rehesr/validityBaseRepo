@@ -205,6 +205,25 @@ with st.sidebar:
     )
     exp_base = Path(exp_base_str).expanduser()
 
+    st.divider()
+    _zip_uploads = st.file_uploader(
+        "Load experiments from zip",
+        type=["zip"],
+        accept_multiple_files=True,
+        help="Upload experiment zips downloaded from a sweep to use in Sweep Results and Leaderboard.",
+    )
+    if "_loaded_exp_dirs" not in st.session_state:
+        st.session_state["_loaded_exp_dirs"] = {}
+    for _uz in (_zip_uploads or []):
+        if _uz.name not in st.session_state["_loaded_exp_dirs"]:
+            _tmp = Path(tempfile.mkdtemp())
+            with zipfile.ZipFile(io.BytesIO(_uz.read())) as _zf:
+                _zf.extractall(_tmp)
+            for _d in sorted(_tmp.iterdir()):
+                if _d.is_dir() and (_d / "config.yaml").exists():
+                    st.session_state["_loaded_exp_dirs"][_uz.name] = _d
+                    break
+
 # ── tabs ──────────────────────────────────────────────────────────────────────
 
 tab_extract, tab_results, tab_leaderboard = st.tabs(
@@ -701,9 +720,16 @@ with tab_extract:
 with tab_results:
     st.subheader("Sweep experiment results")
 
-    experiments = list_experiments(exp_base)
+    _disk_experiments = list_experiments(exp_base) if exp_base_str.strip() and exp_base.exists() else []
+    if exp_base_str.strip() and not exp_base.exists():
+        st.warning(
+            f"Directory `{exp_base}` not found — it may be a local path not accessible from this server. "
+            "Upload experiment zips in the sidebar instead."
+        )
+    _zip_experiments = list(st.session_state.get("_loaded_exp_dirs", {}).values())
+    experiments = sorted(_disk_experiments + _zip_experiments, key=lambda p: p.name, reverse=True)
     if not experiments:
-        st.info(f"No experiments found in `{exp_base}`. Run a sweep first.")
+        st.info("No experiments found. Run a sweep or upload an experiment zip in the sidebar.")
     else:
         exp_names = [p.name for p in experiments]
         selected_exp_name = st.selectbox("Experiment", exp_names, key="results_exp_select")
@@ -912,9 +938,16 @@ with tab_results:
 with tab_leaderboard:
     st.subheader("Leaderboard — best F1 per model across selected experiments")
 
-    experiments = list_experiments(exp_base)
+    _disk_experiments = list_experiments(exp_base) if exp_base_str.strip() and exp_base.exists() else []
+    if exp_base_str.strip() and not exp_base.exists():
+        st.warning(
+            f"Directory `{exp_base}` not found — it may be a local path not accessible from this server. "
+            "Upload experiment zips in the sidebar instead."
+        )
+    _zip_experiments = list(st.session_state.get("_loaded_exp_dirs", {}).values())
+    experiments = sorted(_disk_experiments + _zip_experiments, key=lambda p: p.name, reverse=True)
     if not experiments:
-        st.info(f"No experiments found in `{exp_base}`.")
+        st.info("No experiments found. Run a sweep or upload an experiment zip in the sidebar.")
     else:
         _all_selected = all(
             st.session_state.get(f"lb_chk_{exp.name}", True) for exp in experiments
