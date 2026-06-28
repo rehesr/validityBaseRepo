@@ -24,8 +24,10 @@ from src.evaluate import (
     _extract_tickers_and_names,
     _parse_labels_content,
     aggregate_scores,
+    build_sentiment_consensus,
     canonicalize_ticker,
     evaluate_experiment,
+    parse_result_sentiments,
 )
 
 REPO_ROOT = Path(__file__).parent
@@ -53,6 +55,32 @@ def load_prompt(name: str) -> str:
     path = REPO_ROOT / "prompts" / name
     with path.open(encoding="utf-8") as f:
         return f.read()
+
+
+def reference_tickers_from_payload(payload: dict[str, Any]) -> dict[str, list[str]]:
+    tickers_by_doc: dict[str, list[str]] = {}
+    for doc in payload.get("documents", []):
+        doc_id = doc.get("doc_id")
+        labels = doc.get("labels", [])
+        if not isinstance(doc_id, str) or not isinstance(labels, list):
+            continue
+        tickers = {
+            canonicalize_ticker(label["ticker"])
+            for label in labels
+            if isinstance(label, dict)
+            and label.get("label") == 1
+            and isinstance(label.get("ticker"), str)
+            and label["ticker"].strip()
+        }
+        tickers_by_doc[doc_id] = sorted(tickers)
+    return tickers_by_doc
+
+
+def resolve_config_path(exp_dir: Path, value: str | None) -> Path | None:
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else exp_dir / path
 
 
 def list_experiments(base_dir: Path) -> list[Path]:
@@ -243,14 +271,41 @@ with tab_extract:
     with sh_col2:
         temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.05, key="ex_temp")
     with sh_col3:
-        max_tokens = st.number_input("Max tokens", 256, 8192, 4096, 256, key="ex_max_tokens")
+        max_tokens = st.number_input("Max tokens", 256, 12000, 4096, 256, key="ex_max_tokens")
 
-    _default_prompt = load_prompt("tickerize_v2.txt")
+    custom_model_ids = st.text_input(
+        "Custom model IDs (overrides model group)",
+        value="",
+        placeholder="provider/model-name, provider/model-name",
+        help="Comma-separated OpenRouter model IDs. When set, overrides the model group above.",
+        key="ex_custom_models",
+    )
+    if custom_model_ids.strip():
+        _custom_ids = [m.strip() for m in custom_model_ids.split(",") if m.strip()]
+        model_options = [
+            {"id": mid, "name": mid.split("/")[-1] if "/" in mid else mid}
+            for mid in _custom_ids
+        ]
+        model_group = "custom"
+
+    task = st.radio(
+        "Task",
+        ["Ticker extraction", "Sentiment labeling"],
+        horizontal=True,
+        key="extract_task",
+    )
+    is_sentiment_task = task == "Sentiment labeling"
+    _default_prompt = load_prompt("sentiment_labeling.txt" if is_sentiment_task else "tickerize_v1.txt")
+    prompt_help = (
+        "`{{transcript}}` is replaced with article text; `{{tickers}}` is replaced with the ticker list"
+        if is_sentiment_task
+        else "`{{transcript}}` is replaced with the article text"
+    )
     prompt_template = st.text_area(
-        "Prompt — edit freely; `{{transcript}}` is replaced with the article text",
+        f"Prompt — edit freely; {prompt_help}",
         value=_default_prompt,
         height=300,
-        key="prompt_template",
+        key=f"prompt_template_{task}",
     )
 
     st.divider()
@@ -277,9 +332,18 @@ with tab_extract:
                 )
             else:
                 st.caption(f"Will run all {len(model_options)} models in **{model_group}** in parallel.")
-            confidence_threshold = st.slider(
-                "Confidence threshold", min_value=0.0, max_value=1.0, value=0.5, step=0.05
-            )
+            if is_sentiment_task:
+                sentiment_tickers_text = st.text_input(
+                    "Tickers to score",
+                    value="",
+                    placeholder="AAPL, MSFT, NVDA",
+                )
+                confidence_threshold = 0.0
+            else:
+                sentiment_tickers_text = ""
+                confidence_threshold = st.slider(
+                    "Confidence threshold", min_value=0.0, max_value=1.0, value=0.5, step=0.05
+                )
         with col_right:
             uploaded = st.file_uploader("Upload article (.txt)", type=["txt"])
             pasted = st.text_area("Or paste article text here", height=220)
@@ -292,12 +356,21 @@ with tab_extract:
 
         _doc_id = Path(uploaded.name).stem if uploaded else f"paste_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
-        can_run = bool(article_text) and bool(api_key)
-        btn_label = f"Sweep {len(model_options)} models" if sweep_mode else "Extract"
+        sentiment_tickers = [
+            ticker.strip().upper()
+            for ticker in sentiment_tickers_text.split(",")
+            if ticker.strip()
+        ]
+        can_run = bool(article_text) and bool(api_key) and (not is_sentiment_task or bool(sentiment_tickers))
+        btn_label = f"Sweep {len(model_options)} models" if sweep_mode else ("Score Sentiment" if is_sentiment_task else "Extract")
         run_clicked = st.button(btn_label, disabled=not can_run, type="primary")
+        if is_sentiment_task and article_text and api_key and not sentiment_tickers:
+            st.caption("Enter at least one ticker to enable sentiment scoring.")
 
         if run_clicked and can_run:
             prompt = prompt_template.replace("{{transcript}}", article_text)
+            if is_sentiment_task:
+                prompt = prompt.replace("{{tickers}}", ", ".join(sentiment_tickers))
 
             if not sweep_mode:
                 with st.spinner(f"Calling {selected_model['name']}..."):
@@ -312,40 +385,62 @@ with tab_extract:
                     c3.metric("Output tokens", result.get("output_tokens") or "—")
 
                     content = result.get("content", "") or ""
-                    labels, parse_error = _parse_labels_content(content)
-
-                    if parse_error:
-                        st.warning("Response could not be parsed as valid JSON.")
-                        st.code(content, language="json")
-                    else:
-                        tickers, company_names, _ = _extract_tickers_and_names(
-                            labels, threshold=confidence_threshold
-                        )
-                        if not tickers:
-                            st.info("No tickers extracted above the confidence threshold.")
+                    if is_sentiment_task:
+                        sentiments, parse_error = parse_result_sentiments(result)
+                        if parse_error:
+                            st.warning("Response could not be parsed as sentiment JSON.")
+                            st.code(content, language="json")
                         else:
-                            conf_map: dict[str, Any] = {}
-                            for label in labels:
-                                if isinstance(label, dict) and isinstance(label.get("ticker"), str):
-                                    conf_map[canonicalize_ticker(label["ticker"])] = label.get("confidence", "—")
-                            result_df = pd.DataFrame([
+                            sentiment_df = pd.DataFrame([
                                 {
-                                    "Ticker": t,
-                                    "Company Name": ", ".join(sorted(company_names.get(t, set()))) or "—",
-                                    "Confidence": conf_map.get(t, "—"),
+                                    "Ticker": ticker,
+                                    "Score": values["score"],
+                                    "Confidence": values["confidence"],
                                 }
-                                for t in sorted(tickers)
+                                for ticker, values in sorted(sentiments.items())
                             ])
-                            st.markdown(f"**{len(result_df)} ticker(s) extracted**")
-                            st.dataframe(result_df, use_container_width=True, hide_index=True)
-                            df_download_button(result_df, "extracted_tickers.csv")
+                            if sentiment_df.empty:
+                                st.info("No sentiment scores returned.")
+                            else:
+                                st.dataframe(sentiment_df, use_container_width=True, hide_index=True)
+                                df_download_button(sentiment_df, "sentiment_scores.csv")
+                    else:
+                        labels, parse_error = _parse_labels_content(content)
+                        if parse_error:
+                            st.warning("Response could not be parsed as valid JSON.")
+                            st.code(content, language="json")
+                        else:
+                            tickers, company_names, _ = _extract_tickers_and_names(
+                                labels, threshold=confidence_threshold
+                            )
+                            if not tickers:
+                                st.info("No tickers extracted above the confidence threshold.")
+                            else:
+                                conf_map: dict[str, Any] = {}
+                                for label in labels:
+                                    if isinstance(label, dict) and isinstance(label.get("ticker"), str):
+                                        conf_map[canonicalize_ticker(label["ticker"])] = label.get("confidence", "—")
+                                result_df = pd.DataFrame([
+                                    {
+                                        "Ticker": t,
+                                        "Company Name": ", ".join(sorted(company_names.get(t, set()))) or "—",
+                                        "Confidence": conf_map.get(t, "—"),
+                                    }
+                                    for t in sorted(tickers)
+                                ])
+                                st.markdown(f"**{len(result_df)} ticker(s) extracted**")
+                                st.dataframe(result_df, use_container_width=True, hide_index=True)
+                                df_download_button(result_df, "extracted_tickers.csv")
 
                     with st.expander("Raw model response"):
                         st.code(content, language="json")
 
                     st.session_state["_last_extract"] = {
                         "mode": "single",
+                        "task": task,
                         "doc_id": _doc_id,
+                        "prompt_template": prompt_template,
+                        "rendered_prompt": prompt,
                         "model_options": [selected_model],
                         "results": {selected_model["name"]: result},
                         "model_group": model_group,
@@ -385,55 +480,82 @@ with tab_extract:
                 )
                 df_download_button(metrics_df, "sweep_metrics.csv")
 
-                st.markdown("### Ticker Comparison")
                 model_names = [m["name"] for m in model_options]
-                parsed_sweep: dict[str, tuple] = {}
-                for m in model_options:
-                    r = sweep_results.get(m["name"], {})
-                    content = r.get("content", "") or ""
-                    labels, parse_error = _parse_labels_content(content)
-                    if not parse_error:
-                        tickers, cnames, _ = _extract_tickers_and_names(labels, threshold=confidence_threshold)
-                        cmap: dict[str, Any] = {}
-                        for label in labels:
-                            if isinstance(label, dict) and isinstance(label.get("ticker"), str):
-                                cmap[canonicalize_ticker(label["ticker"])] = label.get("confidence")
-                        parsed_sweep[m["name"]] = (tickers, cnames, cmap)
-                    else:
-                        parsed_sweep[m["name"]] = (set(), {}, {})
-
-                all_sweep_tickers: set[str] = set()
-                all_sweep_names: dict[str, set] = {}
-                for tickers, cnames, _ in parsed_sweep.values():
-                    all_sweep_tickers |= tickers
-                    for t, n in cnames.items():
-                        all_sweep_names.setdefault(t, set()).update(n)
-
-                if not all_sweep_tickers:
-                    st.info("No tickers extracted by any model.")
+                if is_sentiment_task:
+                    st.markdown("### Sentiment Comparison")
+                    score_rows = []
+                    for m in model_options:
+                        r = sweep_results.get(m["name"], {})
+                        sentiments, parse_error = parse_result_sentiments(r)
+                        if parse_error:
+                            score_rows.append({
+                                "Model": m["name"],
+                                "Ticker": "",
+                                "Score": None,
+                                "Confidence": None,
+                                "Error": r.get("error") or "parse_error",
+                            })
+                            continue
+                        for ticker, values in sorted(sentiments.items()):
+                            score_rows.append({
+                                "Model": m["name"],
+                                "Ticker": ticker,
+                                "Score": values["score"],
+                                "Confidence": values["confidence"],
+                                "Error": r.get("error") or "",
+                            })
+                    score_df = pd.DataFrame(score_rows)
+                    st.dataframe(score_df, use_container_width=True, hide_index=True)
+                    df_download_button(score_df, "sentiment_comparison.csv")
                 else:
-                    comp_rows = []
-                    for t in sorted(all_sweep_tickers):
-                        row: dict = {
-                            "Ticker": t,
-                            "Company Name": ", ".join(sorted(all_sweep_names.get(t, set()))) or "—",
-                        }
-                        votes = 0
-                        for name in model_names:
-                            tickers, _, cmap = parsed_sweep[name]
-                            if t in tickers:
-                                row[name] = round(cmap.get(t) or 1.0, 2)
-                                votes += 1
-                            else:
-                                row[name] = None
-                        row["Votes"] = f"{votes}/{len(model_names)}"
-                        comp_rows.append(row)
-                    comp_df = pd.DataFrame(comp_rows)
-                    st.dataframe(
-                        comp_df.style.format({n: "{:.2f}" for n in model_names}, na_rep="—"),
-                        use_container_width=True, hide_index=True,
-                    )
-                    df_download_button(comp_df, "ticker_comparison.csv")
+                    st.markdown("### Ticker Comparison")
+                    parsed_sweep: dict[str, tuple] = {}
+                    for m in model_options:
+                        r = sweep_results.get(m["name"], {})
+                        content = r.get("content", "") or ""
+                        labels, parse_error = _parse_labels_content(content)
+                        if not parse_error:
+                            tickers, cnames, _ = _extract_tickers_and_names(labels, threshold=confidence_threshold)
+                            cmap: dict[str, Any] = {}
+                            for label in labels:
+                                if isinstance(label, dict) and isinstance(label.get("ticker"), str):
+                                    cmap[canonicalize_ticker(label["ticker"])] = label.get("confidence")
+                            parsed_sweep[m["name"]] = (tickers, cnames, cmap)
+                        else:
+                            parsed_sweep[m["name"]] = (set(), {}, {})
+
+                    all_sweep_tickers: set[str] = set()
+                    all_sweep_names: dict[str, set] = {}
+                    for tickers, cnames, _ in parsed_sweep.values():
+                        all_sweep_tickers |= tickers
+                        for t, n in cnames.items():
+                            all_sweep_names.setdefault(t, set()).update(n)
+
+                    if not all_sweep_tickers:
+                        st.info("No tickers extracted by any model.")
+                    else:
+                        comp_rows = []
+                        for t in sorted(all_sweep_tickers):
+                            row: dict = {
+                                "Ticker": t,
+                                "Company Name": ", ".join(sorted(all_sweep_names.get(t, set()))) or "—",
+                            }
+                            votes = 0
+                            for name in model_names:
+                                tickers, _, cmap = parsed_sweep[name]
+                                if t in tickers:
+                                    row[name] = round(cmap.get(t) or 1.0, 2)
+                                    votes += 1
+                                else:
+                                    row[name] = None
+                            row["Votes"] = f"{votes}/{len(model_names)}"
+                            comp_rows.append(row)
+                        comp_df = pd.DataFrame(comp_rows)
+                        st.dataframe(
+                            comp_df.style.format({n: "{:.2f}" for n in model_names}, na_rep="—"),
+                            use_container_width=True, hide_index=True,
+                        )
+                        df_download_button(comp_df, "ticker_comparison.csv")
 
                 with st.expander("Raw responses"):
                     for m in model_options:
@@ -443,7 +565,10 @@ with tab_extract:
 
                 st.session_state["_last_extract"] = {
                     "mode": "sweep",
+                    "task": task,
                     "doc_id": _doc_id,
+                    "prompt_template": prompt_template,
+                    "rendered_prompt": prompt,
                     "model_options": model_options,
                     "results": sweep_results,
                     "model_group": model_group,
@@ -483,16 +608,42 @@ with tab_extract:
                                     _out = _res_dir / f"{_slug}__{_ex['doc_id']}.json"
                                     with _out.open("w", encoding="utf-8") as _f:
                                         json.dump(_r, _f, indent=2, ensure_ascii=False)
+                                        _f.write("\n")
                                 _cfg = {
                                     "name": _save_name,
                                     "model_group": _ex["model_group"],
+                                    "task": "sentiment" if _ex.get("task") == "Sentiment labeling" else "tickerization",
+                                    "prompt": "prompts/sentiment_labeling.txt" if _ex.get("task") == "Sentiment labeling" else "",
                                     "input_dir": "",
+                                    "reference": "",
                                     "temperature": _ex["temperature"],
                                     "max_tokens": _ex["max_tokens"],
                                     "models": _ex["model_options"],
                                 }
                                 with (_new_exp / "config.yaml").open("w", encoding="utf-8") as _f:
                                     yaml.safe_dump(_cfg, _f, sort_keys=False)
+                                with (_new_exp / "prompt.txt").open("w", encoding="utf-8") as _f:
+                                    _f.write(_ex["prompt_template"])
+                                with (_new_exp / "log.jsonl").open("w", encoding="utf-8") as _f:
+                                    for _m in _ex["model_options"]:
+                                        _r = _ex["results"].get(_m["name"], {})
+                                        _f.write(json.dumps({
+                                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                                            "model": _m["id"],
+                                            "model_name": _m["name"],
+                                            "doc_id": _ex["doc_id"],
+                                            "request": {
+                                                "prompt": _ex["rendered_prompt"],
+                                                "temperature": _ex["temperature"],
+                                                "max_tokens": _ex["max_tokens"],
+                                            },
+                                            "content": _r.get("content"),
+                                            "latency_ms": _r.get("latency_ms"),
+                                            "input_tokens": _r.get("input_tokens"),
+                                            "output_tokens": _r.get("output_tokens"),
+                                            "finish_reason": _r.get("finish_reason"),
+                                            "error": _r.get("error"),
+                                        }, ensure_ascii=False) + "\n")
                                 st.success(f"Saved to `{_new_exp}`")
                             except PermissionError:
                                 st.warning(
@@ -522,7 +673,10 @@ with tab_extract:
                         _cfg = {
                             "name": _save_name,
                             "model_group": _ex["model_group"],
+                            "task": "sentiment" if _ex.get("task") == "Sentiment labeling" else "tickerization",
+                            "prompt": "prompts/sentiment_labeling.txt" if _ex.get("task") == "Sentiment labeling" else "",
                             "input_dir": "",
+                            "reference": "",
                             "temperature": _ex["temperature"],
                             "max_tokens": _ex["max_tokens"],
                             "models": _ex["model_options"],
@@ -531,6 +685,28 @@ with tab_extract:
                             f"{_exp_folder_name}/config.yaml",
                             yaml.safe_dump(_cfg, sort_keys=False),
                         )
+                        _zf.writestr(f"{_exp_folder_name}/prompt.txt", _ex["prompt_template"])
+                        _log_lines = []
+                        for _m in _ex["model_options"]:
+                            _r = _ex["results"].get(_m["name"], {})
+                            _log_lines.append(json.dumps({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "model": _m["id"],
+                                "model_name": _m["name"],
+                                "doc_id": _ex["doc_id"],
+                                "request": {
+                                    "prompt": _ex["rendered_prompt"],
+                                    "temperature": _ex["temperature"],
+                                    "max_tokens": _ex["max_tokens"],
+                                },
+                                "content": _r.get("content"),
+                                "latency_ms": _r.get("latency_ms"),
+                                "input_tokens": _r.get("input_tokens"),
+                                "output_tokens": _r.get("output_tokens"),
+                                "finish_reason": _r.get("finish_reason"),
+                                "error": _r.get("error"),
+                            }, ensure_ascii=False))
+                        _zf.writestr(f"{_exp_folder_name}/log.jsonl", "\n".join(_log_lines) + "\n")
                     st.download_button(
                         "Download zip",
                         data=_zip_buf.getvalue(),
@@ -561,10 +737,28 @@ with tab_extract:
             )
         sw_exp_name = st.text_input(
             "Experiment name",
-            value=model_group,
+            value=f"sentiment_{model_group}" if is_sentiment_task else model_group,
             key="sw_exp_name",
             help="Prefix for the experiment folder (a timestamp is appended automatically).",
         )
+        reference_payload: dict[str, Any] | None = None
+        reference_json_text = ""
+        reference_tickers_by_doc: dict[str, list[str]] = {}
+        if is_sentiment_task:
+            sw_reference_upload = st.file_uploader(
+                "reference.json for sentiment tickers",
+                type=["json"],
+                key="sw_sentiment_reference",
+                help="Positive labels in this file become the ticker list for each document.",
+            )
+            if sw_reference_upload:
+                try:
+                    reference_json_text = sw_reference_upload.read().decode("utf-8")
+                    reference_payload = json.loads(reference_json_text)
+                    reference_tickers_by_doc = reference_tickers_from_payload(reference_payload)
+                    st.caption(f"Loaded ticker lists for {len(reference_tickers_by_doc)} document(s).")
+                except Exception as exc:
+                    st.warning(f"Could not parse reference.json: {exc}")
 
         # Resolve article list: directory → zip upload → nothing
         sw_input_path = Path(os.path.expanduser(sw_input_dir)) if sw_input_dir.strip() else None
@@ -600,17 +794,58 @@ with tab_extract:
         else:
             sw_articles = []
 
+        missing_reference_docs = (
+            [
+                doc_id for doc_id, _ in sw_articles
+                if doc_id not in reference_tickers_by_doc
+            ]
+            if is_sentiment_task and sw_articles
+            else []
+        )
+        docs_without_tickers = (
+            [
+                doc_id for doc_id, _ in sw_articles
+                if doc_id in reference_tickers_by_doc and not reference_tickers_by_doc[doc_id]
+            ]
+            if is_sentiment_task and sw_articles
+            else []
+        )
         st.caption(
             f"{len(sw_articles)} article(s) · {len(model_options)} model(s) · "
             f"{len(sw_articles) * len(model_options)} total API calls"
         )
+        if missing_reference_docs:
+            st.warning(
+                "Reference is missing doc_id values for: "
+                + ", ".join(missing_reference_docs[:10])
+                + (" ..." if len(missing_reference_docs) > 10 else "")
+            )
+        if docs_without_tickers:
+            st.warning(
+                "Reference has no positive tickers for: "
+                + ", ".join(docs_without_tickers[:10])
+                + (" ..." if len(docs_without_tickers) > 10 else "")
+            )
 
-        can_sweep = bool(api_key) and bool(sw_articles)
+        can_sweep = (
+            bool(api_key)
+            and bool(sw_articles)
+            and (
+                not is_sentiment_task
+                or (
+                    bool(reference_tickers_by_doc)
+                    and not missing_reference_docs
+                    and not docs_without_tickers
+                )
+            )
+        )
         sweep_clicked = st.button(
             "Run Sweep", disabled=not can_sweep, type="primary", key="run_sweep_btn"
         )
         if not sw_articles and api_key:
             st.caption("Add an input directory or upload a zip of .txt files to enable the sweep.")
+        if is_sentiment_task and sw_articles and not reference_tickers_by_doc:
+            st.caption("Upload `reference.json` to enable sentiment labeling.")
 
         if sweep_clicked and can_sweep:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -628,6 +863,8 @@ with tab_extract:
             for model in model_options:
                 for doc_id, text in sw_articles:
                     prompt = prompt_template.replace("{{transcript}}", text)
+                    if is_sentiment_task:
+                        prompt = prompt.replace("{{tickers}}", ", ".join(reference_tickers_by_doc[doc_id]))
                     status_text.caption(f"[{done + 1}/{total_calls}] {model['name']} × {doc_id}")
                     result = _sweep_call_model(model["id"], prompt, temperature, int(max_tokens))
                     model_slug = model["id"].replace("/", "_")
@@ -637,6 +874,11 @@ with tab_extract:
                         "model": model["id"],
                         "model_name": model["name"],
                         "doc_id": doc_id,
+                        "request": {
+                            "prompt": prompt,
+                            "temperature": temperature,
+                            "max_tokens": int(max_tokens),
+                        },
                         "latency_ms": result.get("latency_ms"),
                         "input_tokens": result.get("input_tokens"),
                         "output_tokens": result.get("output_tokens"),
@@ -656,8 +898,11 @@ with tab_extract:
             cfg_to_save = {
                 "name": sw_exp_name,
                 "model_group": model_group,
+                "task": "sentiment" if is_sentiment_task else "tickerization",
+                "prompt": "prompts/sentiment_labeling.txt" if is_sentiment_task else "",
                 "input_dir": sw_input_dir,
                 "output_base": sw_output_base,
+                "reference": "",
                 "temperature": temperature,
                 "max_tokens": int(max_tokens),
                 "models": model_options,
@@ -670,13 +915,20 @@ with tab_extract:
                     new_exp_dir = Path(os.path.expanduser(sw_output_base)) / sw_exp_folder
                     results_dir_sw = new_exp_dir / "results"
                     results_dir_sw.mkdir(parents=True, exist_ok=True)
+                    cfg_for_disk = dict(cfg_to_save)
+                    if is_sentiment_task and reference_json_text:
+                        ref_path = new_exp_dir / "reference.json"
+                        ref_path.write_text(reference_json_text, encoding="utf-8")
+                        cfg_for_disk["reference"] = str(ref_path)
                     for model_slug, doc_id, result in sw_results_mem:
                         result_file = results_dir_sw / f"{model_slug}__{doc_id}.json"
                         with result_file.open("w", encoding="utf-8") as f:
                             json.dump(result, f, indent=2, ensure_ascii=False)
                             f.write("\n")
                     with (new_exp_dir / "config.yaml").open("w", encoding="utf-8") as f:
-                        yaml.safe_dump(cfg_to_save, f, sort_keys=False)
+                        yaml.safe_dump(cfg_for_disk, f, sort_keys=False)
+                    with (new_exp_dir / "prompt.txt").open("w", encoding="utf-8") as f:
+                        f.write(prompt_template)
                     with (new_exp_dir / "log.jsonl").open("w", encoding="utf-8") as f:
                         f.write("\n".join(log_lines) + "\n")
                     st.success(f"Results saved to `{new_exp_dir}`.")
@@ -694,6 +946,10 @@ with tab_extract:
             if not saved_to_disk:
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    cfg_for_zip = dict(cfg_to_save)
+                    if is_sentiment_task and reference_json_text:
+                        cfg_for_zip["reference"] = "reference.json"
+                        zf.writestr(f"{sw_exp_folder}/reference.json", reference_json_text)
                     for model_slug, doc_id, result in sw_results_mem:
                         zf.writestr(
                             f"{sw_exp_folder}/results/{model_slug}__{doc_id}.json",
@@ -701,7 +957,11 @@ with tab_extract:
                         )
                     zf.writestr(
                         f"{sw_exp_folder}/config.yaml",
-                        yaml.safe_dump(cfg_to_save, sort_keys=False),
+                        yaml.safe_dump(cfg_for_zip, sort_keys=False),
+                    )
+                    zf.writestr(
+                        f"{sw_exp_folder}/prompt.txt",
+                        prompt_template,
                     )
                     zf.writestr(
                         f"{sw_exp_folder}/log.jsonl",
@@ -737,56 +997,137 @@ with tab_results:
 
         # ── Evaluate ──────────────────────────────────────────────────────────
         has_results = load_scores_csv(selected_exp) is not None
-        with st.expander("Run Evaluation", expanded=not has_results):
-            st.caption("Upload your `reference.json` to score this experiment against ground-truth labels.")
-            with st.expander("`reference.json` format"):
-                st.markdown(
-                    "A JSON file with a `documents` array. Each entry maps a `doc_id` "
-                    "(the article filename stem, without `.txt`) to its ground-truth tickers. "
-                    "Set `\"label\": 1` for a true ticker and `\"label\": 0` to exclude one."
+        exp_cfg: dict[str, Any] = {}
+        config_path = selected_exp / "config.yaml"
+        if config_path.exists():
+            with config_path.open(encoding="utf-8") as f:
+                exp_cfg = yaml.safe_load(f) or {}
+        is_sentiment_exp = (
+            exp_cfg.get("task") == "sentiment"
+            or "sentiment" in str(exp_cfg.get("name", "")).lower()
+            or "sentiment_labeling" in str(exp_cfg.get("prompt", ""))
+        )
+        if not is_sentiment_exp:
+            with st.expander("Run Evaluation", expanded=not has_results):
+                st.caption("Upload your `reference.json` to score this experiment against ground-truth labels.")
+                with st.expander("`reference.json` format"):
+                    st.markdown(
+                        "A JSON file with a `documents` array. Each entry maps a `doc_id` "
+                        "(the article filename stem, without `.txt`) to its ground-truth tickers. "
+                        "Set `\"label\": 1` for a true ticker and `\"label\": 0` to exclude one."
+                    )
+                    st.code(
+                        '{\n'
+                        '  "documents": [\n'
+                        '    {\n'
+                        '      "doc_id": "article_123",\n'
+                        '      "labels": [\n'
+                        '        {"ticker": "AAPL", "label": 1},\n'
+                        '        {"ticker": "GOOG", "label": 1},\n'
+                        '        {"ticker": "TSLA", "label": 0}\n'
+                        '      ]\n'
+                        '    },\n'
+                        '    {\n'
+                        '      "doc_id": "article_456",\n'
+                        '      "labels": [\n'
+                        '        {"ticker": "MSFT", "label": 1}\n'
+                        '      ]\n'
+                        '    }\n'
+                        '  ]\n'
+                        '}',
+                        language="json",
+                    )
+                ref_file = st.file_uploader("reference.json", type=["json"], key="ref_upload")
+                if ref_file:
+                    if st.button("Run Evaluation", type="primary", key="run_eval_btn"):
+                        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="wb") as tmp:
+                            tmp.write(ref_file.read())
+                            tmp_path = tmp.name
+                        try:
+                            with st.spinner("Running evaluation..."):
+                                evaluate_experiment(selected_exp, tmp_path)
+                            st.success("Evaluation complete.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Evaluation failed: {exc}")
+                        finally:
+                            Path(tmp_path).unlink(missing_ok=True)
+
+        if is_sentiment_exp:
+            consensus_exists = (selected_exp / "eval" / "sentiment_consensus.csv").exists()
+            with st.expander("Build Sentiment Consensus", expanded=not consensus_exists):
+                st.caption(
+                    "Build per-document/ticker sentiment consensus from this sentiment sweep."
                 )
-                st.code(
-                    '{\n'
-                    '  "documents": [\n'
-                    '    {\n'
-                    '      "doc_id": "article_123",\n'
-                    '      "labels": [\n'
-                    '        {"ticker": "AAPL", "label": 1},\n'
-                    '        {"ticker": "GOOG", "label": 1},\n'
-                    '        {"ticker": "TSLA", "label": 0}\n'
-                    '      ]\n'
-                    '    },\n'
-                    '    {\n'
-                    '      "doc_id": "article_456",\n'
-                    '      "labels": [\n'
-                    '        {"ticker": "MSFT", "label": 1}\n'
-                    '      ]\n'
-                    '    }\n'
-                    '  ]\n'
-                    '}',
-                    language="json",
+                configured_ref = resolve_config_path(selected_exp, exp_cfg.get("reference"))
+                ref_exists = configured_ref is not None and configured_ref.exists()
+                if ref_exists:
+                    st.caption(f"Using reference from config: `{configured_ref}`")
+                sentiment_ref_upload = st.file_uploader(
+                    "Optional reference.json override",
+                    type=["json"],
+                    key="sentiment_consensus_ref_upload",
                 )
-            ref_file = st.file_uploader("reference.json", type=["json"], key="ref_upload")
-            if ref_file:
-                if st.button("Run Evaluation", type="primary", key="run_eval_btn"):
-                    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="wb") as tmp:
-                        tmp.write(ref_file.read())
-                        tmp_path = tmp.name
+                agree_threshold = st.number_input(
+                    "Consensus max pairwise difference",
+                    min_value=0.0,
+                    max_value=2.0,
+                    value=0.50,
+                    step=0.05,
+                    key="sentiment_agree_threshold",
+                )
+                if st.button(
+                    "Build Sentiment Consensus",
+                    type="primary",
+                    key="build_sentiment_consensus_btn",
+                    disabled=not (ref_exists or sentiment_ref_upload is not None),
+                ):
+                    tmp_path = None
                     try:
-                        with st.spinner("Running evaluation..."):
-                            evaluate_experiment(selected_exp, tmp_path)
-                        st.success("Evaluation complete.")
+                        if sentiment_ref_upload is not None:
+                            with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="wb") as tmp:
+                                tmp.write(sentiment_ref_upload.read())
+                                tmp_path = tmp.name
+                            ref_path_for_consensus = Path(tmp_path)
+                        elif configured_ref is not None:
+                            ref_path_for_consensus = configured_ref
+                        else:
+                            raise ValueError("A reference.json file is required.")
+                        with st.spinner("Building sentiment consensus..."):
+                            build_sentiment_consensus(
+                                exp_dir=selected_exp,
+                                ref_path=ref_path_for_consensus,
+                                agree_max_abs_dev=float(agree_threshold),
+                                review_max_abs_dev=float(agree_threshold),
+                            )
+                        st.success("Sentiment consensus complete.")
                         st.rerun()
                     except Exception as exc:
-                        st.error(f"Evaluation failed: {exc}")
+                        st.error(f"Sentiment consensus failed: {exc}")
                     finally:
-                        Path(tmp_path).unlink(missing_ok=True)
+                        if tmp_path:
+                            Path(tmp_path).unlink(missing_ok=True)
 
         # ── Results ───────────────────────────────────────────────────────────
         df = load_scores_csv(selected_exp)
 
+        sentiment_consensus_path = selected_exp / "eval" / "sentiment_consensus.csv"
+        if sentiment_consensus_path.exists():
+            st.markdown("### Sentiment Consensus")
+            sentiment_df = pd.read_csv(sentiment_consensus_path)
+            st.dataframe(sentiment_df, use_container_width=True, hide_index=True)
+            df_download_button(sentiment_df, "sentiment_consensus.csv")
+            sentiment_summary = selected_exp / "eval" / "sentiment_summary.md"
+            if sentiment_summary.exists():
+                with st.expander("Sentiment summary"):
+                    st.markdown(sentiment_summary.read_text(encoding="utf-8"))
+
         if df is None:
-            st.info("No results yet — upload a `reference.json` above to run evaluation.")
+            if is_sentiment_exp:
+                if not sentiment_consensus_path.exists():
+                    st.info("No sentiment consensus yet — build it above.")
+            else:
+                st.info("No results yet — upload a `reference.json` above to run evaluation.")
         else:
             n_models = df["model"].nunique()
             n_docs = df["doc_id"].nunique()

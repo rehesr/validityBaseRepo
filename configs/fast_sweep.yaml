@@ -1,7 +1,7 @@
 name: fast
 prompt: prompts/tickerize_v2.txt
 model_group: fast
-input_dir: ~/data/tickerization/inputs/ticker_articles
+input_dir: ~/data/tickerization/inputs/articles
 reference: ~/data/tickerization/inputs/reference.json
 output_base: ~/data/tickerization/experiments
 temperature: 0

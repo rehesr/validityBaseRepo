@@ -11,6 +11,7 @@ def call_model(
     prompt: str,
     temperature: float = 0,
     max_tokens: int = 4096,
+    provider: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Call a model via OpenRouter and return a full log-friendly record."""
     client = OpenAI(
@@ -19,12 +20,15 @@ def call_model(
     )
     t0 = time.time()
     try:
-        response = client.chat.completions.create(
-            model=model_id,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        request: dict[str, Any] = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if provider:
+            request["extra_body"] = {"provider": provider}
+        response = client.chat.completions.create(**request)
         latency_ms = int((time.time() - t0) * 1000)
         usage = response.usage
         return {
